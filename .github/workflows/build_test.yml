@@ -1,0 +1,212 @@
+name: Build and Test Application
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  build_test:
+    name: Build and Test
+    runs-on: ubuntu-latest
+    outputs:
+      package_manager: ${{ steps.detect.outputs.package_manager }}
+      install_command: ${{ steps.detect.outputs.install_command }}
+      test_command: ${{ steps.detect.outputs.test_command }}
+      build_command: ${{ steps.detect.outputs.build_command }}
+      has_package_json: ${{ steps.detect.outputs.has_package_json }}
+      has_tests: ${{ steps.detect.outputs.has_tests }}
+      has_build_script: ${{ steps.detect.outputs.has_build_script }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Detect project tooling
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          has_package_json=false
+          package_manager=none
+          install_command=""
+          test_command=""
+          build_command=""
+          has_tests=false
+          has_build_script=false
+
+          if [ -f package.json ]; then
+            has_package_json=true
+            package_manager=npm
+            install_command="npm install"
+
+            if [ -f package-lock.json ]; then
+              install_command="npm ci"
+            elif [ -f yarn.lock ]; then
+              package_manager=yarn
+              install_command="yarn install --frozen-lockfile"
+            elif [ -f pnpm-lock.yaml ]; then
+              package_manager=pnpm
+              install_command="pnpm install --frozen-lockfile"
+            fi
+
+            if node -e "const p=require('./package.json'); process.exit(p.scripts && p.scripts.test ? 0 : 1)"; then
+              has_tests=true
+              case "$package_manager" in
+                npm) test_command="npm test -- --watch=false" ;;
+                yarn) test_command="yarn test --watch=false" ;;
+                pnpm) test_command="pnpm test -- --watch=false" ;;
+              esac
+            fi
+
+            if node -e "const p=require('./package.json'); process.exit(p.scripts && p.scripts.build ? 0 : 1)"; then
+              has_build_script=true
+              case "$package_manager" in
+                npm) build_command="npm run build" ;;
+                yarn) build_command="yarn build" ;;
+                pnpm) build_command="pnpm build" ;;
+              esac
+            fi
+          fi
+
+          {
+            echo "has_package_json=$has_package_json"
+            echo "package_manager=$package_manager"
+            echo "install_command=$install_command"
+            echo "test_command=$test_command"
+            echo "build_command=$build_command"
+            echo "has_tests=$has_tests"
+            echo "has_build_script=$has_build_script"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Setup Node.js
+        if: steps.detect.outputs.has_package_json == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: ${{ steps.detect.outputs.package_manager }}
+
+      - name: Enable Corepack for pnpm
+        if: steps.detect.outputs.package_manager == 'pnpm'
+        shell: bash
+        run: corepack enable
+
+      - name: Install project dependencies
+        if: steps.detect.outputs.has_package_json == 'true'
+        shell: bash
+        run: ${{ steps.detect.outputs.install_command }}
+
+      - name: Skip install for non-Node project
+        if: steps.detect.outputs.has_package_json != 'true'
+        run: echo "No package.json found at repository root. Skipping Node.js install step."
+
+      - name: Run tests
+        if: steps.detect.outputs.has_tests == 'true'
+        shell: bash
+        run: ${{ steps.detect.outputs.test_command }}
+
+      - name: Skip tests when not configured
+        if: steps.detect.outputs.has_tests != 'true'
+        run: echo "No test script detected. Skipping tests."
+
+      - name: Build application
+        if: steps.detect.outputs.has_build_script == 'true'
+        shell: bash
+        run: ${{ steps.detect.outputs.build_command }}
+
+      - name: Skip application build when not configured
+        if: steps.detect.outputs.has_build_script != 'true'
+        run: echo "No build script detected. Skipping application build."
+
+  docker_scan:
+    name: Build Docker Image and Scan
+    runs-on: ubuntu-latest
+    needs: build_test
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate Dockerfile presence
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f ./Dockerfile ]; then
+            echo "Dockerfile not found at ./Dockerfile"
+            exit 1
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        shell: bash
+        run: docker build -t my-app:1.0.0 -f ./Dockerfile .
+
+      - name: Scan Docker image with Docker Scout
+        uses: docker/scout-action@v1
+        with:
+          command: cves
+          image: my-app:1.0.0
+          file: ./Dockerfile
+          only-severities: critical,high
+          exit-code: true
+
+  docker_compose_test:
+    name: Docker Compose Test
+    runs-on: ubuntu-latest
+    needs: docker_scan
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate Docker Compose file presence
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f docker-compose.yml ]; then
+            echo "compose_file=docker-compose.yml" >> "$GITHUB_ENV"
+          elif [ -f docker-compose.yaml ]; then
+            echo "compose_file=docker-compose.yaml" >> "$GITHUB_ENV"
+          elif [ -f compose.yml ]; then
+            echo "compose_file=compose.yml" >> "$GITHUB_ENV"
+          elif [ -f compose.yaml ]; then
+            echo "compose_file=compose.yaml" >> "$GITHUB_ENV"
+          else
+            echo "No docker compose file found. Expected one of: docker-compose.yml, docker-compose.yaml, compose.yml, compose.yaml"
+            exit 1
+          fi
+
+      - name: Start application with Docker Compose
+        shell: bash
+        run: docker compose up -d --build
+
+      - name: Check running containers
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Running containers:"
+          docker ps
+
+          unhealthy_containers="$(docker ps -a --filter health=unhealthy --format '{{.Names}}')"
+          exited_containers="$(docker ps -a --filter status=exited --format '{{.Names}}')"
+
+          if [ -n "$unhealthy_containers" ]; then
+            echo "Unhealthy containers detected:"
+            echo "$unhealthy_containers"
+            exit 1
+          fi
+
+          if [ -n "$exited_containers" ]; then
+            echo "Exited containers detected:"
+            echo "$exited_containers"
+            exit 1
+          fi
+
+          echo "All containers are running and healthy."
+
+      - name: Stop Docker Compose services
+        if: always()
+        shell: bash
+        run: docker compose down
