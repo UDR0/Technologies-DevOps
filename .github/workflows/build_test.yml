@@ -167,6 +167,8 @@ jobs:
           file: ./Dockerfile
           only-severities: critical,high
           exit-code: true
+          dockerhub-user: ${{ secrets.DOCKERHUB_USERNAME }}
+          dockerhub-password: ${{ secrets.DOCKERHUB_TOKEN }}
 
   docker_compose_test:
     name: Docker Compose Test
